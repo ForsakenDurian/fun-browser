@@ -11,63 +11,77 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
-pub struct URL {
-    scheme: String,
-    host: String,
-    port: u16,
-    path: String,
+pub enum URL {
+    Http {
+        tls: bool,
+        host: String,
+        port: u16,
+        path: String,
+    },
+    File {
+        path: String,
+    },
+    Data {
+        content: String,
+    },
 }
 
 impl URL {
     pub fn new(url: &str) -> Self {
-        let (scheme, rest) = url.split_once("://").expect("URL has no scheme");
-
-        let mut rest = rest.to_string();
-
-        if !rest.contains('/') {
-            rest = rest + "/";
+        if let Some(rest) = url.strip_prefix("data:") {
+            let (_media_type, content) = rest.split_once(',').expect("data URL has no comma");
+            return URL::Data {
+                content: content.to_string(),
+            };
         }
-        let (host, path) = rest.split_once('/').unwrap();
-        let path = format!("/{path}");
 
-        let port: u16 = match scheme {
-            "http" => 80,
-            "https" => 443,
-            "file" => 0,
+        let (scheme, rest) = url.split_once("://").expect("URL has no scheme");
+        match scheme {
+            "file" => URL::File {
+                path: rest.to_string(),
+            },
+            "http" | "https" => {
+                // parse url
+                let mut rest = rest.to_string();
+
+                if !rest.contains('/') {
+                    rest = rest + "/";
+                }
+                let (host, path) = rest.split_once('/').unwrap();
+                let path = format!("/{path}");
+
+                let port: u16 = match scheme {
+                    "http" => 80,
+                    "https" => 443,
+                    _ => panic!("Unsupported scheme {}", scheme),
+                };
+                // custom port override
+                let (host, port) = match host.split_once(':') {
+                    Some((h, p)) => (h, p.parse::<u16>().expect("bad port")),
+                    None => (host, port),
+                };
+                URL::Http {
+                    tls: scheme == "https",
+                    host: host.to_string(),
+                    port,
+                    path: path.to_string(),
+                }
+            }
             _ => panic!("Unsupported scheme {}", scheme),
-        };
-        let (host, port) = match host.split_once(':') {
-            Some((h,p)) => (h, p.parse::<u16>().expect("bad port")),
-            None => (host, port),
-        };
-
-        URL {
-            scheme: scheme.to_string(),
-            host: host.to_string(),
-            port,
-            path,
         }
     }
 
-    pub fn request(&self) -> String {
-        if self.scheme == "file" {
-            return std::fs::read_to_string(&self.path).expect("could not read file");
-        }
-        let tcp = TcpStream::connect((self.host.as_str(), self.port))
-            .expect("Unable to connect to server");
-        let mut stream: Box<dyn Stream> = if self.scheme == "https" {
+    fn http_get(tls: bool, host: &str, port: u16, path: &str) -> String {
+        let tcp = TcpStream::connect((host, port)).expect("Unable to connect to server");
+        let mut stream: Box<dyn Stream> = if tls {
             let connector = TlsConnector::new().expect("TLS setup failed");
-            Box::new(
-                connector
-                    .connect(&self.host, tcp)
-                    .expect("TLS handshake failed"),
-            )
+            Box::new(connector.connect(&host, tcp).expect("TLS handshake failed"))
         } else {
             Box::new(tcp)
         };
 
-        let mut request = format!("GET {} HTTP/1.0\r\n", self.path);
-        request.push_str(&format!("Host: {}\r\n", self.host));
+        let mut request = format!("GET {} HTTP/1.0\r\n", path);
+        request.push_str(&format!("Host: {}\r\n", host));
         request.push_str(&format!("User-Agent: {}/{}\r\n", USER_AGENT, VERSION));
         request.push_str("\r\n");
         stream.write_all(&request.as_bytes()).expect("write failed");
@@ -95,17 +109,39 @@ impl URL {
         response.read_to_string(&mut content).expect("read failed");
         content
     }
+
+    pub fn request(&self) -> String {
+        match self {
+            URL::File { path } => std::fs::read_to_string(path).expect("file read failed"),
+            URL::Data { content } => content.clone(),
+            URL::Http {
+                tls,
+                host,
+                port,
+                path,
+            } => Self::http_get(*tls, host, *port, path),
+        }
+    }
 }
 
 pub fn show(body: &str) {
+    let mut chars = body.char_indices();
     let mut in_tag = false;
-    for c in body.chars() {
+    while let Some((i, c)) = chars.next() {
         if c == '<' {
             in_tag = true;
         } else if c == '>' {
             in_tag = false;
         } else if !in_tag {
-            print!("{c}");
+            if body[i..].starts_with("&lt;") {
+                chars.nth(2);
+                print!("<");
+            } else if body[i..].starts_with("&gt;") {
+                chars.nth(2);
+                print!(">");
+            } else {
+                print!("{c}");
+            }
         }
     }
 }
@@ -115,6 +151,8 @@ pub fn load(url: URL) {
     show(&body);
 }
 fn main() {
-    let url = std::env::args().nth(1).unwrap_or_else(|| format!("file://{}/test.html", env!("CARGO_MANIFEST_DIR")));
+    let url = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| format!("file://{}/test.html", env!("CARGO_MANIFEST_DIR")));
     load(URL::new(&url));
 }
